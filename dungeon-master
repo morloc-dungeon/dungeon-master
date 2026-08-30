@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""dungeon-master -- admin/curation tool for the morloc-dungeon org.
+
+Clones the demo repositories, runs their Makefile-driven tests against the
+active morloc version, and bundles the passing demos into a single release
+tarball plus a manifest. See DESIGN.md for the full rationale.
+
+This is an admin tool, not the tool a learner runs. The learner-facing path is
+`mim demos`, which consumes the release tarball produced here.
+
+Membership rule: a repo is a demo iff it contains a TAGS file with at least one
+valid tag. A repo with no TAGS file is silently ignored (this is how the
+dungeon-master repo and draft repos are excluded).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+ORG = "morloc-dungeon"
+
+# Directories relative to this script.
+ROOT = Path(__file__).resolve().parent
+REPOS_DIR = ROOT / "repos"      # cloned demo repos
+DIST_DIR = ROOT / "dist"        # release artifacts (tarball + manifest)
+ALLOW_FAIL_FILE = ROOT / "allow-fail"  # demos permitted to fail without halting
+
+TAG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def info(msg):
+    print(msg, file=sys.stderr)
+
+
+def die(msg, code=1):
+    print(f"dungeon-master: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, cwd=None, capture=False):
+    """Run a command. Returns (returncode, stdout, stderr)."""
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        text=True,
+    )
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+# --------------------------------------------------------------------------
+# GitHub org enumeration (admin side: the REST API is fine here -- a token
+# lifts the rate limit, and this is not the cost-sensitive learner path)
+# --------------------------------------------------------------------------
+
+def github_get(url):
+    req = urllib.request.Request(url)
+    req.add_header("Accept", "application/vnd.github+json")
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode())
+
+
+def list_org_repos():
+    """Names of every non-archived repo in the org. Demo membership is decided
+    later, by the presence of a valid TAGS file after cloning."""
+    repos = []
+    page = 1
+    while True:
+        url = f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}"
+        try:
+            batch = github_get(url)
+        except Exception as e:  # noqa: BLE001 -- report and stop, do not mask
+            die(f"could not list org repos from GitHub: {e}")
+        if not batch:
+            break
+        repos.extend(r["name"] for r in batch if not r.get("archived", False))
+        page += 1
+    return sorted(repos)
+
+
+# --------------------------------------------------------------------------
+# local repo inspection / membership
+# --------------------------------------------------------------------------
+
+def cloned_repos():
+    if not REPOS_DIR.is_dir():
+        return []
+    return sorted(p.name for p in REPOS_DIR.iterdir() if (p / ".git").is_dir())
+
+
+def parse_tags(repo):
+    """Tags declared in a repo's TAGS file, or None if the file is absent.
+
+    An empty-but-present TAGS file yields [] (a present-but-untagged repo, which
+    is not a valid demo). Invalid tag names abort with an error.
+    """
+    tags_file = REPOS_DIR / repo / "TAGS"
+    if not tags_file.is_file():
+        return None
+    tags = []
+    for line in tags_file.read_text().splitlines():
+        tag = line.strip()
+        if not tag or tag.startswith("#"):
+            continue
+        if not TAG_RE.match(tag):
+            die(f"{repo}: invalid tag {tag!r} (allowed: letters, digits, '-', '_')")
+        if tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def demo_repos(tag=None):
+    """Cloned repos that are demos (have >=1 valid tag), optionally tag-filtered."""
+    out = []
+    for repo in cloned_repos():
+        tags = parse_tags(repo)
+        if tags:  # non-None and non-empty
+            if tag is None or tag in tags:
+                out.append(repo)
+    return out
+
+
+def git_hash(repo):
+    code, out, _ = run(["git", "rev-parse", "HEAD"], cwd=REPOS_DIR / repo, capture=True)
+    if code != 0:
+        die(f"could not read HEAD of {repo}")
+    return out.strip()
+
+
+def read_synopsis(repo):
+    """The one-line `synopsis:` from a repo's package.yaml, or "" if absent.
+
+    `synopsis` is morloc's short-description field (see PackageMeta in the
+    compiler's Namespace/State.hs; `description` is the longer one). This is a
+    deliberately minimal scan -- the script is stdlib-only, no YAML parser --
+    but package.yaml keys are top-level and unindented, so a bare `synopsis:`
+    line is unambiguous. Tabs/newlines are stripped so the value stays a single
+    manifest column.
+    """
+    pkg = REPOS_DIR / repo / "package.yaml"
+    if not pkg.is_file():
+        return ""
+    for line in pkg.read_text().splitlines():
+        m = re.match(r"synopsis\s*:\s*(.*)", line)
+        if m:
+            s = m.group(1).strip().strip('"').strip("'")
+            return s.replace("\t", " ").replace("\n", " ")
+    return ""
+
+
+def read_allow_fail():
+    """Repo names permitted to fail without halting a release."""
+    if not ALLOW_FAIL_FILE.is_file():
+        return set()
+    names = set()
+    for line in ALLOW_FAIL_FILE.read_text().splitlines():
+        name = line.strip()
+        if name and not name.startswith("#"):
+            names.add(name)
+    return names
+
+
+# --------------------------------------------------------------------------
+# clone / update
+# --------------------------------------------------------------------------
+
+def clone_or_update(repo):
+    dest = REPOS_DIR / repo
+    if (dest / ".git").is_dir():
+        info(f"updating {repo}")
+        run(["git", "fetch", "--quiet", "origin"], cwd=dest)
+        run(["git", "reset", "--hard", "--quiet", "origin/HEAD"], cwd=dest)
+    else:
+        info(f"cloning {repo}")
+        url = f"https://github.com/{ORG}/{repo}.git"
+        code, _, _ = run(["git", "clone", "--quiet", url, str(dest)])
+        if code != 0:
+            die(f"git clone failed for {repo}")
+
+
+# --------------------------------------------------------------------------
+# morloc version / make
+# --------------------------------------------------------------------------
+
+def active_morloc_version():
+    code, out, _ = run(["morloc", "--version"], capture=True)
+    if code != 0:
+        die("could not run `morloc --version` (is morloc installed and on PATH?)")
+    return out.strip()
+
+
+def make_test(repo):
+    """Run `make clean` then `make test`. Returns (passed, log)."""
+    dest = REPOS_DIR / repo
+    run(["make", "clean"], cwd=dest, capture=True)
+    code, out, err = run(["make", "test"], cwd=dest, capture=True)
+    return code == 0, out + err
+
+
+# --------------------------------------------------------------------------
+# release bundling
+# --------------------------------------------------------------------------
+
+def bundle_sources(items, staging):
+    """Export each repo's committed tree at a specific commit (no .git, no build
+    junk) under staging/<repo>/. `items` is a list of (repo, ref); archiving by
+    the exact tested commit guarantees the bundle matches what was tested."""
+    for repo, ref in items:
+        dest = staging / repo
+        dest.mkdir(parents=True)
+        # Pipe `git archive <ref>` into `tar -x`: the committed tree only, so no
+        # .git and no build junk. Shell-free two-process pipe.
+        p1 = subprocess.Popen(
+            ["git", "archive", "--format=tar", ref],
+            cwd=REPOS_DIR / repo, stdout=subprocess.PIPE,
+        )
+        p2 = subprocess.Popen(["tar", "-x", "-C", str(dest)], stdin=p1.stdout)
+        p1.stdout.close()
+        if p2.wait() != 0 or p1.wait() != 0:
+            die(f"could not stage sources for {repo} at {ref}")
+
+
+def write_manifest(path, version, rows):
+    """rows: list of (repo, hash, tags-list), written sorted by repo. Each line
+    is `repo<TAB>hash<TAB>tags<TAB>synopsis`; the synopsis is read here so a
+    consumer (mim demos --list) can show it without unpacking the tarball."""
+    lines = [f"# morloc-version: {version}"]
+    for repo, h, tags in sorted(rows, key=lambda r: r[0]):
+        lines.append(f"{repo}\t{h}\t{','.join(tags)}\t{read_synopsis(repo)}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------
+# per-runner test reports (consumed by `bundle` to reconcile across platforms)
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# subcommands
+# --------------------------------------------------------------------------
+
+def cmd_list(args):
+    repos = demo_repos(args.tag)
+    if not repos:
+        die("no matching demo repos; run `dungeon-master clone` first")
+    for repo in repos:
+        print(f"{repo}\t{','.join(parse_tags(repo))}")
+
+
+def cmd_clone(args):
+    REPOS_DIR.mkdir(parents=True, exist_ok=True)
+    for repo in list_org_repos():
+        clone_or_update(repo)
+    demos = demo_repos(args.tag)
+    info(f"{len(demos)} demo repo(s)"
+         + (f" tagged '{args.tag}'" if args.tag else ""))
+
+
+def cmd_update(args):
+    repos = demo_repos(args.tag) or cloned_repos()
+    if not repos:
+        die("no cloned repos; run `dungeon-master clone` first")
+    for repo in repos:
+        clone_or_update(repo)
+
+
+def _run_corpus(repos, allow_fail):
+    """Test every repo. Returns (passing, blocking) where passing is a list of
+    (repo, hash, tags-list) and blocking is the repos that failed and are not on
+    allow-fail. An allow-fail repo that fails is simply excluded from passing."""
+    passing, blocking = [], []
+    for repo in repos:
+        ok, _ = make_test(repo)
+        if ok:
+            info(f"  pass {repo}")
+            passing.append((repo, git_hash(repo), parse_tags(repo)))
+        elif repo in allow_fail:
+            info(f"  FAIL {repo}  (allow-fail: excluded)")
+        else:
+            info(f"  FAIL {repo}  (blocks the release)")
+            blocking.append(repo)
+    return passing, blocking
+
+
+def cmd_test(args):
+    repos = demo_repos(args.tag)
+    if not repos:
+        die("no matching demo repos; run `dungeon-master clone` first")
+    version = active_morloc_version()
+    info(f"testing {len(repos)} demo(s) against morloc {version}")
+    _, blocking = _run_corpus(repos, read_allow_fail())
+    if blocking:
+        die(f"{len(blocking)} demo(s) failed: {', '.join(blocking)}")
+
+
+def cmd_release(args):
+    """Gate the whole corpus against the active morloc, and (with --bundle)
+    produce the release tarball + manifest.
+
+    Both CI runners call this to gate: any failing demo not on allow-fail exits
+    nonzero, which fails the runner and -- via GitHub Actions -- cancels the
+    release. Only one runner (Linux; the bundle is OS-agnostic source) passes
+    --bundle to also write the artifacts."""
+    version = active_morloc_version()
+    if args.morloc_version and args.morloc_version != version:
+        die(f"active morloc is {version} but --morloc-version says "
+            f"{args.morloc_version}; provision {args.morloc_version} first")
+
+    repos = demo_repos()  # a release always covers the whole corpus
+    if not repos:
+        die("no demo repos; run `dungeon-master clone` first")
+
+    info(f"release: testing {len(repos)} demo(s) against morloc {version}")
+    passing, blocking = _run_corpus(repos, read_allow_fail())
+    if blocking:
+        die(f"release halted: {len(blocking)} demo(s) failed and are not on "
+            f"allow-fail: {', '.join(blocking)}")
+
+    if not args.bundle:
+        info(f"release: {len(passing)} demo(s) green (no --bundle; gate only)")
+        return
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    tarball = out / "demos.tar.gz"
+    manifest = out / "manifest.tsv"
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = Path(tmp) / "demos"
+        staging.mkdir()
+        bundle_sources([(r, h) for r, h, _ in passing], staging)
+        code, _, _ = run(["tar", "-czf", str(tarball), "-C", str(staging.parent),
+                          staging.name])
+        if code != 0:
+            die("could not create release tarball")
+    write_manifest(manifest, version, passing)
+    info(f"release: {len(passing)} demo(s) bundled for morloc {version}")
+    info(f"  {tarball}")
+    info(f"  {manifest}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="dungeon-master",
+        description="Admin/curation tool for the morloc-dungeon org.",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def add_tag(sp):
+        sp.add_argument("--tag", help="restrict to demos carrying this tag")
+
+    sp = sub.add_parser("list", help="list demos and their tags")
+    add_tag(sp)
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("clone", help="clone/update all demo repos")
+    add_tag(sp)
+    sp.set_defaults(func=cmd_clone)
+
+    sp = sub.add_parser("update", help="update already-cloned repos")
+    add_tag(sp)
+    sp.set_defaults(func=cmd_update)
+
+    sp = sub.add_parser("test", help="run each demo's tests against active morloc")
+    add_tag(sp)
+    sp.set_defaults(func=cmd_test)
+
+    sp = sub.add_parser("release",
+                        help="gate the corpus; with --bundle, write the tarball")
+    sp.add_argument("--bundle", action="store_true",
+                    help="also write demos.tar.gz + manifest.tsv (one runner only)")
+    sp.add_argument("--out", default=str(DIST_DIR),
+                    help=f"output directory for artifacts (default {DIST_DIR})")
+    sp.add_argument("--morloc-version",
+                    help="assert the active compiler is this version")
+    sp.set_defaults(func=cmd_release)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
