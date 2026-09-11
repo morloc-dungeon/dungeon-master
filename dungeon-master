@@ -8,9 +8,14 @@ tarball plus a manifest. See DESIGN.md for the full rationale.
 This is an admin tool, not the tool a learner runs. The learner-facing path is
 `mim demos`, which consumes the release tarball produced here.
 
-Membership rule: a repo is a demo iff it contains a TAGS file with at least one
-valid tag. A repo with no TAGS file is silently ignored (this is how the
-dungeon-master repo and draft repos are excluded).
+Membership rule: a directory under the repos dir is a demo iff it contains a
+TAGS file with at least one valid tag. A directory with no TAGS file is silently
+ignored, and the org's non-demo repos (SKIP) are never cloned or tested.
+
+The repos dir defaults to `repos/` beside this script (where `clone` puts the
+org's repos) and can be pointed anywhere with `--repos-dir`, e.g. at a checkout
+holding unpushed demos: `dungeon-master --repos-dir .. test`. A `.git` is only
+needed for `release`, which cites and archives the tested commit.
 """
 
 import argparse
@@ -27,9 +32,16 @@ ORG = "morloc-dungeon"
 
 # Directories relative to this script.
 ROOT = Path(__file__).resolve().parent
-REPOS_DIR = ROOT / "repos"      # cloned demo repos
+DEFAULT_REPOS_DIR = ROOT / "repos"  # where `clone` puts the org's repos
 DIST_DIR = ROOT / "dist"        # release artifacts (tarball + manifest)
 ALLOW_FAIL_FILE = ROOT / "allow-fail"  # demos permitted to fail without halting
+
+# Set from --repos-dir in main() before any subcommand runs.
+REPOS_DIR = DEFAULT_REPOS_DIR
+
+# Org repos that carry a TAGS file but are not demos: this tool, and the
+# template a new demo is copied from.
+SKIP = {"dungeon-master", "template"}
 
 TAG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -96,10 +108,17 @@ def list_org_repos():
 # local repo inspection / membership
 # --------------------------------------------------------------------------
 
-def cloned_repos():
+def candidate_dirs():
+    """Directories under the repos dir that could be demos, minus SKIP. No
+    `.git` is required, so a local checkout of unpushed work is testable."""
     if not REPOS_DIR.is_dir():
         return []
-    return sorted(p.name for p in REPOS_DIR.iterdir() if (p / ".git").is_dir())
+    return sorted(p.name for p in REPOS_DIR.iterdir()
+                  if p.is_dir() and not p.name.startswith(".") and p.name not in SKIP)
+
+
+def is_git_repo(repo):
+    return (REPOS_DIR / repo / ".git").is_dir()
 
 
 def parse_tags(repo):
@@ -124,9 +143,9 @@ def parse_tags(repo):
 
 
 def demo_repos(tag=None):
-    """Cloned repos that are demos (have >=1 valid tag), optionally tag-filtered."""
+    """Directories that are demos (have >=1 valid tag), optionally tag-filtered."""
     out = []
-    for repo in cloned_repos():
+    for repo in candidate_dirs():
         tags = parse_tags(repo)
         if tags:  # non-None and non-empty
             if tag is None or tag in tags:
@@ -135,6 +154,8 @@ def demo_repos(tag=None):
 
 
 def git_hash(repo):
+    if not is_git_repo(repo):
+        die(f"{repo} is not a git repository; a release cites the tested commit")
     code, out, _ = run(["git", "rev-parse", "HEAD"], cwd=REPOS_DIR / repo, capture=True)
     if code != 0:
         die(f"could not read HEAD of {repo}")
@@ -180,7 +201,7 @@ def read_allow_fail():
 
 def clone_or_update(repo):
     dest = REPOS_DIR / repo
-    if (dest / ".git").is_dir():
+    if is_git_repo(repo):
         info(f"updating {repo}")
         run(["git", "fetch", "--quiet", "origin"], cwd=dest)
         run(["git", "reset", "--hard", "--quiet", "origin/HEAD"], cwd=dest)
@@ -255,7 +276,7 @@ def write_manifest(path, version, rows):
 def cmd_list(args):
     repos = demo_repos(args.tag)
     if not repos:
-        die("no matching demo repos; run `dungeon-master clone` first")
+        die("no matching demos under the repos dir")
     for repo in repos:
         print(f"{repo}\t{','.join(parse_tags(repo))}")
 
@@ -263,14 +284,15 @@ def cmd_list(args):
 def cmd_clone(args):
     REPOS_DIR.mkdir(parents=True, exist_ok=True)
     for repo in list_org_repos():
-        clone_or_update(repo)
+        if repo not in SKIP:
+            clone_or_update(repo)
     demos = demo_repos(args.tag)
     info(f"{len(demos)} demo repo(s)"
          + (f" tagged '{args.tag}'" if args.tag else ""))
 
 
 def cmd_update(args):
-    repos = demo_repos(args.tag) or cloned_repos()
+    repos = [r for r in (demo_repos(args.tag) or candidate_dirs()) if is_git_repo(r)]
     if not repos:
         die("no cloned repos; run `dungeon-master clone` first")
     for repo in repos:
@@ -278,29 +300,34 @@ def cmd_update(args):
 
 
 def _run_corpus(repos, allow_fail):
-    """Test every repo. Returns (passing, blocking) where passing is a list of
-    (repo, hash, tags-list) and blocking is the repos that failed and are not on
-    allow-fail. An allow-fail repo that fails is simply excluded from passing."""
+    """Test every repo. Returns (passing, blocking): the repos that passed, and
+    the repos that failed and are not on allow-fail. An allow-fail repo that
+    fails is simply excluded from passing."""
     passing, blocking = [], []
     for repo in repos:
-        ok, _ = make_test(repo)
+        ok, log = make_test(repo)
         if ok:
             info(f"  pass {repo}")
-            passing.append((repo, git_hash(repo), parse_tags(repo)))
-        elif repo in allow_fail:
+            passing.append(repo)
+            continue
+        if repo in allow_fail:
             info(f"  FAIL {repo}  (allow-fail: excluded)")
         else:
             info(f"  FAIL {repo}  (blocks the release)")
             blocking.append(repo)
+        # The captured `make test` output, so the failure is diagnosable from
+        # this run alone (a CI log, or a terminal) without re-running make.
+        for line in log.rstrip("\n").splitlines():
+            info(f"    | {line}")
     return passing, blocking
 
 
 def cmd_test(args):
     repos = demo_repos(args.tag)
     if not repos:
-        die("no matching demo repos; run `dungeon-master clone` first")
+        die("no matching demos under the repos dir")
     version = active_morloc_version()
-    info(f"testing {len(repos)} demo(s) against morloc {version}")
+    info(f"testing {len(repos)} demo(s) under {REPOS_DIR} against morloc {version}")
     _, blocking = _run_corpus(repos, read_allow_fail())
     if blocking:
         die(f"{len(blocking)} demo(s) failed: {', '.join(blocking)}")
@@ -322,8 +349,10 @@ def cmd_release(args):
     repos = demo_repos()  # a release always covers the whole corpus
     if not repos:
         die("no demo repos; run `dungeon-master clone` first")
+    for repo in repos:
+        git_hash(repo)  # refuse up front rather than after a long test run
 
-    info(f"release: testing {len(repos)} demo(s) against morloc {version}")
+    info(f"release: testing {len(repos)} demo(s) under {REPOS_DIR} against morloc {version}")
     passing, blocking = _run_corpus(repos, read_allow_fail())
     if blocking:
         die(f"release halted: {len(blocking)} demo(s) failed and are not on "
@@ -332,6 +361,7 @@ def cmd_release(args):
     if not args.bundle:
         info(f"release: {len(passing)} demo(s) green (no --bundle; gate only)")
         return
+    rows = [(r, git_hash(r), parse_tags(r)) for r in passing]
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -340,12 +370,12 @@ def cmd_release(args):
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp) / "demos"
         staging.mkdir()
-        bundle_sources([(r, h) for r, h, _ in passing], staging)
+        bundle_sources([(r, h) for r, h, _ in rows], staging)
         code, _, _ = run(["tar", "-czf", str(tarball), "-C", str(staging.parent),
                           staging.name])
         if code != 0:
             die("could not create release tarball")
-    write_manifest(manifest, version, passing)
+    write_manifest(manifest, version, rows)
     info(f"release: {len(passing)} demo(s) bundled for morloc {version}")
     info(f"  {tarball}")
     info(f"  {manifest}")
@@ -360,28 +390,39 @@ def build_parser():
         prog="dungeon-master",
         description="Admin/curation tool for the morloc-dungeon org.",
     )
+    repos_help = ("directory holding the demo folders, one per demo "
+                  f"(default {DEFAULT_REPOS_DIR}); relative to the cwd")
+    p.add_argument("--repos-dir", default=str(DEFAULT_REPOS_DIR), help=repos_help)
+
+    # The same option on every subcommand, so it shows in `<cmd> -h` and may
+    # follow the subcommand. SUPPRESS keeps the subparser from overwriting a
+    # value given before the subcommand with its own default.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repos-dir", default=argparse.SUPPRESS, help=repos_help)
+
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_tag(sp):
         sp.add_argument("--tag", help="restrict to demos carrying this tag")
 
-    sp = sub.add_parser("list", help="list demos and their tags")
+    sp = sub.add_parser("list", parents=[common], help="list demos and their tags")
     add_tag(sp)
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("clone", help="clone/update all demo repos")
+    sp = sub.add_parser("clone", parents=[common], help="clone/update all demo repos")
     add_tag(sp)
     sp.set_defaults(func=cmd_clone)
 
-    sp = sub.add_parser("update", help="update already-cloned repos")
+    sp = sub.add_parser("update", parents=[common], help="update already-cloned repos")
     add_tag(sp)
     sp.set_defaults(func=cmd_update)
 
-    sp = sub.add_parser("test", help="run each demo's tests against active morloc")
+    sp = sub.add_parser("test", parents=[common],
+                        help="run each demo's tests against active morloc")
     add_tag(sp)
     sp.set_defaults(func=cmd_test)
 
-    sp = sub.add_parser("release",
+    sp = sub.add_parser("release", parents=[common],
                         help="gate the corpus; with --bundle, write the tarball")
     sp.add_argument("--bundle", action="store_true",
                     help="also write demos.tar.gz + manifest.tsv (one runner only)")
@@ -395,7 +436,9 @@ def build_parser():
 
 
 def main():
+    global REPOS_DIR
     args = build_parser().parse_args()
+    REPOS_DIR = Path(args.repos_dir).resolve()
     args.func(args)
 
 
