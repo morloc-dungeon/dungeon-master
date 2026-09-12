@@ -1,0 +1,15 @@
+#!/bin/sh
+# Tag and push a dungeon-master release after the corpus passes.
+#
+# The tests need morloc, which lives only inside a mim environment; the push
+# needs git credentials, which live only on the host. So the corpus is tested
+# through `mim run` (the workspace is mounted into the environment, and `test`
+# needs no git), and the tag is cut here on the host.
+set -e
+
+cd "$(dirname "$0")/.."   # the workspace: every demo is a sibling of dungeon-master
+mim run -- python3 dungeon-master/dungeon-master test --repos-dir .
+
+cd dungeon-master
+git tag "v$(cat VERSION)"
+git push origin "v$(cat VERSION)"
