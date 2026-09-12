@@ -9,6 +9,10 @@ name: Dungeon Release
 # that runner; the publish job `needs:` the whole matrix, so a red leg on EITHER
 # OS cancels the release automatically -- no cross-runner coordination needed.
 # Only the Linux leg bundles (the bundle is OS-agnostic source).
+#
+# A `v*` tag (pushed by `dungeon-master deploy`) gates and publishes
+# against the latest compiler release. A push to main only gates. A manual
+# dispatch gates, and publishes when `publish` is set.
 
 on:
   workflow_dispatch:
@@ -24,6 +28,7 @@ on:
         default: false
   push:
     branches: [main]   # gate only; never publishes
+    tags: ['v*']       # gate + publish
 
 permissions:
   contents: write   # the publish job creates a release
@@ -91,7 +96,9 @@ jobs:
 
   publish:
     needs: gate   # runs only if EVERY gate leg (Linux + macOS) was green
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
