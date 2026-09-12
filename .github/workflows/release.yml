@@ -115,7 +115,10 @@ jobs:
           TAG="demos-$V"
           echo "publishing $TAG"
           # Create the release, or replace its assets if the tag already exists.
+          # This job has no checkout, so gh cannot infer the repository from git.
           gh release create "$TAG" dist/demos.tar.gz dist/manifest.tsv \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Dungeon demos for morloc $V" \
             --notes "Curated morloc-dungeon demos verified against morloc $V (Linux + macOS)." \
-          || gh release upload "$TAG" dist/demos.tar.gz dist/manifest.tsv --clobber
+          || gh release upload "$TAG" dist/demos.tar.gz dist/manifest.tsv \
+               --repo "$GITHUB_REPOSITORY" --clobber
