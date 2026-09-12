@@ -60,9 +60,10 @@ on either OS cancels the release. Only the Linux leg bundles (the bundle is
 OS-agnostic source), and a publish job attaches the tarball to a
 `demos-<version>` GitHub release.
 
-A `v*` tag gates against the latest compiler release and publishes. A push to
-`main` only gates. A manual dispatch can name a compiler version and publishes
-when `publish` is set. To publish by tag, after every demo is pushed and the
+Only a `v*` tag publishes: it gates against the latest compiler release and
+attaches the bundle. A push to `main` only gates, as does a manual dispatch
+(which can name a compiler version), so the corpus is shown green before a tag
+changes what `mim demos` pulls. To publish, after every demo is pushed and the
 corpus passes locally:
 
 ```

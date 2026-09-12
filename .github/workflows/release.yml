@@ -10,8 +10,10 @@ name: Dungeon Release
 # OS cancels the release automatically -- no cross-runner coordination needed.
 # Only the Linux leg bundles (the bundle is OS-agnostic source).
 #
-# A `v*` tag gates and publishes against the latest compiler release. A push to
-# main only gates. A manual dispatch gates, and publishes when `publish` is set.
+# Only a `v*` tag publishes: it gates against the latest compiler release and,
+# when both legs are green, attaches the bundle to a `demos-<version>` release
+# that `mim demos` pulls. A push to main and a manual dispatch only gate, so
+# the corpus is shown green before a tag changes what users pull.
 
 on:
   workflow_dispatch:
@@ -20,14 +22,9 @@ on:
         description: "morloc version to test against (blank = latest release)"
         required: false
         default: ""
-      publish:
-        description: "publish a GitHub release from the bundle"
-        type: boolean
-        required: false
-        default: false
   push:
-    branches: [main]   # gate only; never publishes
-    tags: ['v*']       # gate + publish
+    branches: [main]   # gate only
+    tags: ['v*']       # gate, then publish
 
 permissions:
   contents: write   # the publish job creates a release
@@ -71,23 +68,21 @@ jobs:
       - name: Clone all demos
         run: mim run -- python3 dungeon-master clone
 
-      # The bundle is OS-agnostic source, so only Linux produces it. Both legs
-      # gate; a non-allow-fail failure on either exits nonzero and fails the leg.
-      - name: Gate + bundle (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          V="${{ inputs.morloc_version }}"
-          mim run -- python3 dungeon-master release --bundle --out dist \
-            ${V:+--morloc-version "$V"}
-
-      - name: Gate only (macOS)
-        if: runner.os == 'macOS'
+      # Both legs gate; a non-allow-fail failure on either exits nonzero and
+      # fails the leg. The bundle is OS-agnostic source, so only the Linux leg
+      # of a tag run produces it.
+      - name: Gate
+        if: runner.os == 'macOS' || !startsWith(github.ref, 'refs/tags/v')
         run: |
           V="${{ inputs.morloc_version }}"
           mim run -- python3 dungeon-master release ${V:+--morloc-version "$V"}
 
-      - name: Upload bundle artifact (Linux)
-        if: runner.os == 'Linux'
+      - name: Gate + bundle (Linux, tag)
+        if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/v')
+        run: mim run -- python3 dungeon-master release --bundle --out dist
+
+      - name: Upload bundle artifact (Linux, tag)
+        if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: demos-bundle
@@ -95,9 +90,7 @@ jobs:
 
   publish:
     needs: gate   # runs only if EVERY gate leg (Linux + macOS) was green
-    if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
