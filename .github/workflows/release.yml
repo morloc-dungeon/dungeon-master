@@ -10,9 +10,8 @@ name: Dungeon Release
 # OS cancels the release automatically -- no cross-runner coordination needed.
 # Only the Linux leg bundles (the bundle is OS-agnostic source).
 #
-# A `v*` tag (pushed by `dungeon-master deploy`) gates and publishes
-# against the latest compiler release. A push to main only gates. A manual
-# dispatch gates, and publishes when `publish` is set.
+# A `v*` tag gates and publishes against the latest compiler release. A push to
+# main only gates. A manual dispatch gates, and publishes when `publish` is set.
 
 on:
   workflow_dispatch:

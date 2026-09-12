@@ -35,7 +35,6 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_REPOS_DIR = ROOT / "repos"  # where `clone` puts the org's repos
 DIST_DIR = ROOT / "dist"        # release artifacts (tarball + manifest)
 ALLOW_FAIL_FILE = ROOT / "allow-fail"  # demos permitted to fail without halting
-VERSION_FILE = ROOT / "VERSION"        # this tool's version; `v<VERSION>` tags a release
 
 # Set from --repos-dir in main() before any subcommand runs.
 REPOS_DIR = DEFAULT_REPOS_DIR
@@ -383,102 +382,6 @@ def cmd_release(args):
 
 
 # --------------------------------------------------------------------------
-# deploy: gate, bump, tag, push
-# --------------------------------------------------------------------------
-
-def git_out(args, cwd):
-    """stdout of a git command, or die."""
-    code, out, err = run(["git", *args], cwd=cwd, capture=True)
-    if code != 0:
-        die(f"git {' '.join(args)} failed in {cwd}: {err.strip()}")
-    return out.strip()
-
-
-def read_version():
-    if not VERSION_FILE.is_file():
-        die(f"no VERSION file at {VERSION_FILE}")
-    v = VERSION_FILE.read_text().strip()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", v):
-        die(f"VERSION is {v!r}; expected MAJOR.MINOR.PATCH")
-    return v
-
-
-def bump_version(version, part):
-    major, minor, patch = (int(x) for x in version.split("."))
-    if part == "minor":
-        return f"{major}.{minor + 1}.0"
-    return f"{major}.{minor}.{patch + 1}"
-
-
-def check_demo_published(repo):
-    """A demo's HEAD must be committed, pushed, and what origin's default branch
-    points at: the release workflow tests the org's clones, not this checkout,
-    so anything local-only is tested here and silently not there."""
-    dest = REPOS_DIR / repo
-    if not is_git_repo(repo):
-        die(f"{repo} is not a git repository; the release tests the org's clone of it")
-    if git_out(["status", "--porcelain"], dest):
-        die(f"{repo} has uncommitted changes; commit and push them first")
-    head = git_out(["rev-parse", "HEAD"], dest)
-    # Ask the remote itself rather than a fetched ref: `origin/HEAD` exists only
-    # after a clone, and a demo created locally and pushed has none.
-    remote = git_out(["ls-remote", "origin", "HEAD"], dest).split()
-    if not remote:
-        die(f"{repo}: origin has no HEAD (is the repo pushed?)")
-    if head != remote[0]:
-        die(f"{repo}: HEAD {head[:8]} is not what origin serves ({remote[0][:8]}); "
-            f"push it first")
-
-
-def cmd_deploy(args):
-    """Bump VERSION, tag `v<VERSION>`, and push the tag, after gating the corpus
-    here. The tag push runs the release workflow, which tests the org's clones
-    on both OSes and publishes the demos bundle; this command is the local half
-    of that, and refuses to tag anything CI would test differently."""
-    if git_out(["status", "--porcelain"], ROOT):
-        die("dungeon-master has uncommitted changes; the version bump must be "
-            "the only change in the release commit")
-    branch = git_out(["rev-parse", "--abbrev-ref", "HEAD"], ROOT)
-    if branch != "main":
-        die(f"on branch {branch}; releases are tagged from main")
-
-    repos = demo_repos()
-    if not repos:
-        die("no demo repos under the repos dir")
-    for repo in repos:
-        check_demo_published(repo)
-
-    version = active_morloc_version()
-    info(f"deploy: testing {len(repos)} demo(s) under {REPOS_DIR} "
-         f"against morloc {version}")
-    passing, blocking = _run_corpus(repos, read_allow_fail())
-    if blocking:
-        die(f"release halted: {len(blocking)} demo(s) failed and are not on "
-            f"allow-fail: {', '.join(blocking)}")
-    info(f"deploy: {len(passing)} demo(s) green")
-
-    old = read_version()
-    new = bump_version(old, args.part)
-    tag = f"v{new}"
-    code, _, _ = run(["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}"],
-                     cwd=ROOT, capture=True)
-    if code == 0:
-        die(f"tag {tag} already exists")
-    if args.dry_run:
-        info(f"deploy: would bump {old} -> {new}, tag {tag}, and push (dry run)")
-        return
-
-    VERSION_FILE.write_text(new + "\n")
-    git_out(["add", str(VERSION_FILE)], ROOT)
-    git_out(["commit", "--quiet", "-m", f"Release {tag}"], ROOT)
-    git_out(["tag", tag], ROOT)
-    git_out(["push", "--quiet", "origin", "main", tag], ROOT)
-    info(f"deploy: {old} -> {new}; pushed {tag}")
-    info("  the Dungeon Release workflow now gates on both OSes and publishes "
-         "the bundle")
-
-
-# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -528,14 +431,6 @@ def build_parser():
     sp.add_argument("--morloc-version",
                     help="assert the active compiler is this version")
     sp.set_defaults(func=cmd_release)
-
-    sp = sub.add_parser("deploy", parents=[common],
-                        help="gate the corpus here, bump VERSION, tag, and push")
-    sp.add_argument("part", nargs="?", choices=["minor", "patch"], default="patch",
-                    help="which version component to bump (default patch)")
-    sp.add_argument("--dry-run", action="store_true",
-                    help="gate and report the bump without committing or pushing")
-    sp.set_defaults(func=cmd_deploy)
 
     return p
 

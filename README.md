@@ -37,7 +37,6 @@ dungeon-master clone   [--repos-dir DIR] [--tag T]
 dungeon-master update  [--repos-dir DIR] [--tag T]
 dungeon-master test    [--repos-dir DIR] [--tag T]
 dungeon-master release [--repos-dir DIR] [--bundle] [--out DIR] [--morloc-version V]
-dungeon-master deploy [--repos-dir DIR] [--dry-run] [minor|patch]
 ```
 
 `--repos-dir` is the directory holding one folder per demo, relative to the cwd;
@@ -53,17 +52,6 @@ python3 dungeon-master/dungeon-master test --repos-dir .
 the active compiler is V. `release` requires every demo to be a git repository,
 since the manifest cites and the bundle archives the tested commit.
 
-`deploy` is the local half of a release: it refuses if this checkout or
-any demo has uncommitted changes, or if a demo's `HEAD` is not what its origin
-serves (CI tests the org's clones, not this checkout), gates the whole corpus
-against the active morloc, then bumps `VERSION` (`patch` by default), commits,
-tags `v<VERSION>`, and pushes `main` and the tag. `--dry-run` stops after the
-gate and reports the bump it would make. From the workspace:
-
-```
-python3 dungeon-master/dungeon-master --repos-dir . deploy minor
-```
-
 ## Release CI
 
 `.github/workflows/release.yml` runs the demos in a native `mim` environment
@@ -72,11 +60,18 @@ on either OS cancels the release. Only the Linux leg bundles (the bundle is
 OS-agnostic source), and a publish job attaches the tarball to a
 `demos-<version>` GitHub release.
 
-A `v*` tag (what `deploy` pushes) gates against the latest compiler
-release and publishes. A push to `main` only gates. A manual dispatch can name a
-compiler version and publishes when `publish` is set. `VERSION` is this tool's
-version; the published release is named after the compiler version the demos
-were tested against, so the two numbers are unrelated.
+A `v*` tag gates against the latest compiler release and publishes. A push to
+`main` only gates. A manual dispatch can name a compiler version and publishes
+when `publish` is set. To publish by tag, after every demo is pushed and the
+corpus passes locally:
+
+```
+git tag v$(cat VERSION) && git push origin v$(cat VERSION)
+```
+
+`VERSION` is this tool's version; the published release is named after the
+compiler version the demos were tested against, so the two numbers are
+unrelated.
 
 ## Demo repository contract
 
